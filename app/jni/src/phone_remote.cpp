@@ -30,9 +30,12 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 
 // ---- Configuration ---------------------------------------------------------
-static const char* SERVER_IP   = "192.168.1.10"; // <-- CHANGE to your PC's LAN IP
+// Used only the very first time the app runs, before any IP has been saved
+// via the in-app Settings screen.
+static const char* DEFAULT_SERVER_IP = "192.168.1.10";
 static const int   SERVER_PORT = 5051;
 static const Uint32 AUTO_REFRESH_MS = 5000;
 
@@ -59,6 +62,49 @@ static std::vector<Item> g_sounds;
 static int g_currentCategory = -1; // -1 = viewing category list
 static std::string g_status = "Connecting...";
 static Uint32 g_lastRefreshTicks = 0;
+
+// The PC's LAN IP - editable from the in-app Settings screen, persisted to
+// disk so it survives app restarts.
+static std::string g_serverIp = DEFAULT_SERVER_IP;
+
+enum Screen { SCREEN_LIST, SCREEN_SETTINGS };
+static Screen g_screen = SCREEN_LIST;
+static std::string g_ipEditBuffer; // working copy edited on the Settings screen
+
+// ---- Settings persistence ----------------------------------------------------
+
+static std::string GetConfigFilePath() {
+    char* prefPath = SDL_GetPrefPath("GasolineSoundboard", "PhoneRemote");
+    if (!prefPath) return "";
+    std::string path = std::string(prefPath) + "server_ip.txt";
+    SDL_free(prefPath);
+    return path;
+}
+
+static void LoadSavedServerIp() {
+    std::string path = GetConfigFilePath();
+    if (path.empty()) return;
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return;
+    char buf[64] = { 0 };
+    if (fgets(buf, sizeof(buf), f)) {
+        std::string ip(buf);
+        while (!ip.empty() && (ip.back() == '\n' || ip.back() == '\r' || ip.back() == ' ')) {
+            ip.pop_back();
+        }
+        if (!ip.empty()) g_serverIp = ip;
+    }
+    fclose(f);
+}
+
+static void SaveServerIp(const std::string& ip) {
+    std::string path = GetConfigFilePath();
+    if (path.empty()) return;
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return;
+    fputs(ip.c_str(), f);
+    fclose(f);
+}
 
 // Parse "#RRGGBB" (or "RRGGBB") into RGB bytes; defaults to white on failure.
 static void ParseHexColor(const std::string& hex, Uint8& r, Uint8& g, Uint8& b) {
@@ -123,6 +169,7 @@ static std::vector<Seg> GlyphSegs(char ch) {
         case '(': return { {1,0,0,1},{0,1,0,3},{0,3,1,4} };
         case ')': return { {0,0,1,1},{1,1,1,3},{1,3,0,4} };
         case '_': return { {0,4.6f,2,4.6f} };
+        case '.': return { {0.9f,3.7f,1.1f,3.9f} };
         case '-': return { {0,2,2,2} };
         case '<': return { {2,0,0,2},{0,2,2,4} };
         case '>': return { {0,0,2,2},{2,2,0,4} };
@@ -171,7 +218,7 @@ static int ConnectToServer() {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(SERVER_PORT);
-    if (inet_pton(AF_INET, SERVER_IP, &addr.sin_addr) <= 0) { close(sock); return -1; }
+    if (inet_pton(AF_INET, g_serverIp.c_str(), &addr.sin_addr) <= 0) { close(sock); return -1; }
 
     struct timeval tv{ 4, 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -336,6 +383,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    LoadSavedServerIp();
     RefreshFromServer();
 
     float scrollY = 0.0f;
@@ -372,6 +420,12 @@ int main(int argc, char* argv[]) {
 
         SDL_Rect prevBtn{ leftEdge + outerGap, SIDE_MARGIN, TOP_BTN_SIZE, TOP_BTN_SIZE };
         SDL_Rect nextBtn{ prevBtn.x + TOP_BTN_SIZE + TOP_BTN_GAP, SIDE_MARGIN, TOP_BTN_SIZE, TOP_BTN_SIZE };
+
+        // Small "SETTINGS" button, tucked under Refresh on the status line.
+        // (spacing here must match what DrawCenteredLabel uses internally: cellW/4)
+        int settingsBtnW = TextWidth("SETTINGS", 10, 10 / 4) + 24;
+        SDL_Rect settingsBtn{ winW - SIDE_MARGIN - settingsBtnW, refreshBtn.y + refreshBtn.h + 8, settingsBtnW, 44 };
+
         int rowWidth = winW - 2 * SIDE_MARGIN;
 
         std::vector<SDL_Rect> rowRects(items.size());
@@ -388,13 +442,53 @@ int main(int argc, char* argv[]) {
         float maxScroll = std::max(0.0f, (float)(contentH - winH));
         if (scrollY > maxScroll) scrollY = maxScroll;
 
-        if (SDL_GetTicks() - g_lastRefreshTicks > AUTO_REFRESH_MS) {
+        if (g_screen == SCREEN_LIST && SDL_GetTicks() - g_lastRefreshTicks > AUTO_REFRESH_MS) {
             RefreshFromServer();
         }
 
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
                 running = false;
+            }
+            else if (g_screen == SCREEN_SETTINGS) {
+                // ---- Settings screen: text entry + Back/Save only ----
+                if (ev.type == SDL_TEXTINPUT) {
+                    for (const char* p = ev.text.text; *p; ++p) {
+                        char c = *p;
+                        if ((c >= '0' && c <= '9') || c == '.') {
+                            if (g_ipEditBuffer.size() < 15) g_ipEditBuffer += c;
+                        }
+                    }
+                }
+                else if (ev.type == SDL_KEYDOWN) {
+                    if (ev.key.keysym.sym == SDLK_BACKSPACE && !g_ipEditBuffer.empty()) {
+                        g_ipEditBuffer.pop_back();
+                    }
+                }
+                else if (ev.type == SDL_MOUSEBUTTONUP || ev.type == SDL_FINGERUP) {
+                    int tx, ty;
+                    if (ev.type == SDL_MOUSEBUTTONUP) { tx = ev.button.x; ty = ev.button.y; }
+                    else { tx = (int)(ev.tfinger.x * winW); ty = (int)(ev.tfinger.y * winH); }
+                    SDL_Point pt{ tx, ty };
+
+                    SDL_Rect settingsBackBtn{ SIDE_MARGIN, SIDE_MARGIN, TOP_BTN_SIZE, TOP_BTN_SIZE };
+                    SDL_Rect settingsSaveBtn{ winW - SIDE_MARGIN - TOP_BTN_SIZE, SIDE_MARGIN, TOP_BTN_SIZE, TOP_BTN_SIZE };
+
+                    if (SDL_PointInRect(&pt, &settingsBackBtn)) {
+                        g_screen = SCREEN_LIST;
+                        SDL_StopTextInput();
+                    }
+                    else if (SDL_PointInRect(&pt, &settingsSaveBtn)) {
+                        if (!g_ipEditBuffer.empty()) {
+                            g_serverIp = g_ipEditBuffer;
+                            SaveServerIp(g_serverIp);
+                        }
+                        g_screen = SCREEN_LIST;
+                        SDL_StopTextInput();
+                        RefreshFromServer();
+                    }
+                }
+                continue; // skip the list-screen handling below entirely
             }
             else if (ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_FINGERDOWN) {
                 int tx, ty;
@@ -435,6 +529,11 @@ int main(int argc, char* argv[]) {
                     if (SDL_PointInRect(&pt, &refreshBtn)) {
                         RefreshFromServer();
                     }
+                    else if (SDL_PointInRect(&pt, &settingsBtn)) {
+                        g_ipEditBuffer = g_serverIp;
+                        g_screen = SCREEN_SETTINGS;
+                        SDL_StartTextInput();
+                    }
                     else if (SDL_PointInRect(&pt, &pauseBtn)) {
                         SendPause();
                     }
@@ -472,6 +571,42 @@ int main(int argc, char* argv[]) {
         // ---- Draw ----
         SDL_SetRenderDrawColor(renderer, 24, 24, 28, 255);
         SDL_RenderClear(renderer);
+
+        if (g_screen == SCREEN_SETTINGS) {
+            SDL_Rect settingsBackBtn{ SIDE_MARGIN, SIDE_MARGIN, TOP_BTN_SIZE, TOP_BTN_SIZE };
+            SDL_Rect settingsSaveBtn{ winW - SIDE_MARGIN - TOP_BTN_SIZE, SIDE_MARGIN, TOP_BTN_SIZE, TOP_BTN_SIZE };
+
+            SDL_SetRenderDrawColor(renderer, 120, 60, 60, 255);
+            SDL_RenderFillRect(renderer, &settingsBackBtn);
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+            DrawCenteredLabel(renderer, settingsBackBtn, "<BACK", 13, 14, 2);
+
+            SDL_SetRenderDrawColor(renderer, 60, 150, 90, 255);
+            SDL_RenderFillRect(renderer, &settingsSaveBtn);
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+            DrawCenteredLabel(renderer, settingsSaveBtn, "SAVE", 13, 14, 2);
+
+            SDL_SetRenderDrawColor(renderer, 200, 200, 60, 255);
+            DrawText(renderer, SIDE_MARGIN, SIDE_MARGIN + TOP_BTN_SIZE + 30, "PC IP ADDRESS", 14, 18, 3, 4);
+
+            SDL_Rect ipBox{ SIDE_MARGIN, SIDE_MARGIN + TOP_BTN_SIZE + 80, winW - 2 * SIDE_MARGIN, 100 };
+            SDL_SetRenderDrawColor(renderer, 45, 45, 52, 255);
+            SDL_RenderFillRect(renderer, &ipBox);
+            SDL_SetRenderDrawColor(renderer, 120, 120, 135, 255);
+            SDL_RenderDrawRect(renderer, &ipBox);
+
+            std::string shown = g_ipEditBuffer;
+            if ((SDL_GetTicks() / 500) % 2 == 0) shown += "_"; // blinking cursor
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+            DrawText(renderer, ipBox.x + 20, ipBox.y + 25, shown, 22, 50, 4, 8);
+
+            SDL_SetRenderDrawColor(renderer, 150, 150, 150, 255);
+            DrawText(renderer, SIDE_MARGIN, ipBox.y + ipBox.h + 30, "DIGITS AND DOTS ONLY", 10, 12, 2, 4);
+
+            SDL_RenderPresent(renderer);
+            SDL_Delay(16);
+            continue;
+        }
 
         SDL_Rect listClip{ 0, TOP_BAR_H, winW, winH - TOP_BAR_H };
         SDL_RenderSetClipRect(renderer, &listClip);
@@ -526,6 +661,11 @@ int main(int argc, char* argv[]) {
 
         SDL_SetRenderDrawColor(renderer, 200, 200, 60, 255);
         DrawText(renderer, SIDE_MARGIN, refreshBtn.y + refreshBtn.h + 14, g_status, 10, 12, 2, 10 / 4);
+
+        SDL_SetRenderDrawColor(renderer, 80, 80, 90, 255);
+        SDL_RenderFillRect(renderer, &settingsBtn);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        DrawCenteredLabel(renderer, settingsBtn, "SETTINGS", 10, 12, 2);
 
         SDL_RenderPresent(renderer);
         SDL_Delay(16);
