@@ -1,8 +1,8 @@
 
-# Uncomment this if you're using STL in your project
-# You can find more information here:
-# https://developer.android.com/ndk/guides/cpp-support
-# APP_STL := c++_shared
+# phone_remote.cpp uses std::string/std::vector/exceptions, which need the
+# C++ standard library linked in (otherwise ld fails with "undefined symbol:
+# std::__ndk1::..." for things like std::string's copy constructor).
+APP_STL := c++_shared
 
 APP_ABI := armeabi-v7a arm64-v8a x86 x86_64
 
