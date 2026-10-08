@@ -364,7 +364,7 @@ int main(int argc, char* argv[]) {
 
     SDL_Window* window = SDL_CreateWindow("Gasoline Remote",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        800, 1200, SDL_WINDOW_FULLSCREEN_DESKTOP);
+        800, 1200, SDL_WINDOW_RESIZABLE | SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!window) {
         SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
         return 1;
